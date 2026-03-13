@@ -27,6 +27,8 @@ Open the extension while on any webpage and click **ACTIVE TAB**, or paste a URL
 
 All network requests run through the background service worker (`background.js`), which bypasses CORS restrictions. The popup just handles the UI.
 
+![commentsExtractor preview](assets/commentsExtractor.png)
+
 Supports:
 - `<!-- HTML comments -->`
 - `/* CSS block comments */`
