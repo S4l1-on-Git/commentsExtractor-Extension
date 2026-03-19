@@ -1,29 +1,37 @@
 let currentData = null;
-let currentType = 'html';
+let currentType  = 'html';
 
-const urlInput    = document.getElementById('urlInput');
-const scanBtn     = document.getElementById('scanBtn');
-const activeTabBtn= document.getElementById('activeTabBtn');
-const statusBar   = document.getElementById('statusBar');
-const resultsPanel= document.getElementById('resultsPanel');
-const tabsEl      = document.getElementById('tabs');
-const toolbar     = document.getElementById('toolbar');
+const urlInput     = document.getElementById('urlInput');
+const scanBtn      = document.getElementById('scanBtn');
+const activeTabBtn = document.getElementById('activeTabBtn');
+const statusBar    = document.getElementById('statusBar');
+const resultsPanel = document.getElementById('resultsPanel');
+const tabsEl       = document.getElementById('tabs');
+const toolbar      = document.getElementById('toolbar');
 
+// pre-fill with active tab URL
 chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
   if (tabs[0]?.url) urlInput.value = tabs[0].url;
 });
 
+// ── events ────────────────────────────────────────────────────────────────────
+
 scanBtn.addEventListener('click', () => {
   const url = urlInput.value.trim();
-  if (url) runScan(url);
+  if (!url) return;
+  chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+    // if typed URL matches active tab, use content script (page context)
+    // otherwise fall back to background fetch
+    if (tabs[0]?.url === url) runViaContentScript(tabs[0].id, url);
+    else runViaBackground(url);
+  });
 });
 
 activeTabBtn.addEventListener('click', () => {
   chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-    if (tabs[0]?.url) {
-      urlInput.value = tabs[0].url;
-      runScan(tabs[0].url);
-    }
+    if (!tabs[0]) return;
+    urlInput.value = tabs[0].url;
+    runViaContentScript(tabs[0].id, tabs[0].url);
   });
 });
 
@@ -43,62 +51,94 @@ tabsEl.addEventListener('click', e => {
 document.getElementById('exportJson').addEventListener('click', exportJson);
 document.getElementById('exportTxt').addEventListener('click',  exportTxt);
 
-function runScan(url) {
-  setLoading(true);
-  currentData = null;
-  tabsEl.style.display = 'none';
-  toolbar.style.display = 'none';
+// ── active tab: inject content.js → message it ───────────────────────────────
+// content.js reads the live DOM directly — same as DevTools console,
+// no CORS, no session issues, no isolated world problems.
 
+function runViaContentScript(tabId, url) {
+  setLoading(true);
+
+  chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }, () => {
+    if (chrome.runtime.lastError) {
+      // injection failed (chrome:// page, PDF, etc.) — fall back to background
+      runViaBackground(url);
+      return;
+    }
+    chrome.tabs.sendMessage(tabId, { action: 'extractFromPage', url }, response => {
+      setLoading(false);
+      if (chrome.runtime.lastError) { showError(chrome.runtime.lastError.message); return; }
+      if (!response?.success)       { showError(response?.error ?? 'no response from page'); return; }
+      applyData(response.data);
+    });
+  });
+}
+
+// ── manual / external URL: background fetch ───────────────────────────────────
+
+function runViaBackground(url) {
+  setLoading(true);
   chrome.runtime.sendMessage({ action: 'extract', url }, response => {
     setLoading(false);
     if (chrome.runtime.lastError) { showError(chrome.runtime.lastError.message); return; }
-    if (!response.success)        { showError(response.error); return; }
-
-    currentData = response.data;
-
-    const s = currentData.summary;
-    document.getElementById('htmlCount').textContent = s.htmlComments;
-    document.getElementById('cssCount').textContent  = s.cssComments;
-    document.getElementById('jsCount').textContent   = s.jsComments;
-
-    statusBar.innerHTML = `
-      <span>HTML <span class="stat-value html">${s.htmlComments}</span></span>
-      <span>CSS <span class="stat-value css">${s.cssFiles} files · ${s.cssComments}</span></span>
-      <span>JS <span class="stat-value js">${s.jsFiles} files · ${s.jsComments}</span></span>
-      <span>total <span class="stat-value total">${s.total}</span></span>
-    `;
-
-    tabsEl.style.display = 'flex';
-    toolbar.style.display = 'flex';
-    renderResults();
+    if (!response?.success)       { showError(response?.error ?? 'unknown error'); return; }
+    applyData(response.data);
   });
 }
+
+// ── apply result data to UI ───────────────────────────────────────────────────
+
+function applyData(data) {
+  currentData = data;
+  tabsEl.style.display  = 'none';
+  toolbar.style.display = 'none';
+
+  const s = data.summary;
+  document.getElementById('htmlCount').textContent = s.htmlComments;
+  document.getElementById('cssCount').textContent  = s.cssComments;
+  document.getElementById('jsCount').textContent   = s.jsComments;
+
+  statusBar.innerHTML = `
+    <span>HTML <span class="stat-value html">${s.htmlComments}</span></span>
+    <span>CSS <span class="stat-value css">${s.cssFiles} files · ${s.cssComments}</span></span>
+    <span>JS <span class="stat-value js">${s.jsFiles} files · ${s.jsComments}</span></span>
+    <span>total <span class="stat-value total">${s.total}</span></span>
+  `;
+
+  tabsEl.style.display  = 'flex';
+  toolbar.style.display = 'flex';
+  renderResults();
+}
+
+// ── rendering ─────────────────────────────────────────────────────────────────
 
 function renderResults() {
   if (!currentData) return;
   resultsPanel.innerHTML = '';
 
   if (currentType === 'html') {
-    renderGroup('HTML Page', currentData.html, 'html');
+    if (currentData.html.length) renderGroup('HTML Page', currentData.html, 'html');
+    else resultsPanel.innerHTML = emptyHtml('no HTML comments found');
+
   } else if (currentType === 'css') {
-    currentData.css.forEach(f => {
-      if (f.comments.length) renderGroup(f.url.split('/').pop() || f.url, f.comments, 'css', f.url);
-    });
-    if (!currentData.css.some(f => f.comments.length))
-      resultsPanel.innerHTML = emptyHtml('no CSS comments found');
+    const wc = currentData.css.filter(f => f.comments.length > 0);
+    if (wc.length) wc.forEach(f => renderGroup(
+      f.url === 'inline' ? 'inline <style>' : (f.url.split('/').pop() || f.url),
+      f.comments, 'css', f.url === 'inline' ? null : f.url
+    ));
+    else resultsPanel.innerHTML = emptyHtml('no CSS comments found');
+
   } else {
-    currentData.js.forEach(f => {
-      if (f.comments.length) renderGroup(f.url.split('/').pop() || f.url, f.comments, 'js', f.url);
-    });
-    if (!currentData.js.some(f => f.comments.length))
-      resultsPanel.innerHTML = emptyHtml('no JS comments found');
+    const wc = currentData.js.filter(f => f.comments.length > 0);
+    if (wc.length) wc.forEach(f => renderGroup(
+      f.url === 'inline' ? 'inline <script>' : (f.url.split('/').pop() || f.url),
+      f.comments, 'js', f.url === 'inline' ? null : f.url
+    ));
+    else resultsPanel.innerHTML = emptyHtml('no JS comments found');
   }
 }
 
 function renderGroup(name, comments, type, fullUrl) {
-  if (!comments.length) { resultsPanel.innerHTML = emptyHtml(`no ${type.toUpperCase()} comments found`); return; }
-
-  const group = document.createElement('div');
+  const group  = document.createElement('div');
   group.className = 'file-group';
 
   const header = document.createElement('div');
@@ -106,7 +146,7 @@ function renderGroup(name, comments, type, fullUrl) {
 
   const nameEl = document.createElement('div');
   nameEl.className = 'file-name';
-  nameEl.title = fullUrl || name;
+  if (fullUrl) nameEl.title = fullUrl;
   nameEl.innerHTML = `<span class="file-type-label ${type}">[${type.toUpperCase()}]</span>${esc(name)}`;
 
   const right = document.createElement('div');
@@ -144,18 +184,24 @@ function renderGroup(name, comments, type, fullUrl) {
   resultsPanel.appendChild(group);
 }
 
+// ── helpers ───────────────────────────────────────────────────────────────────
+
 function setLoading(on) {
-  scanBtn.disabled = on;
+  currentData           = null;
+  tabsEl.style.display  = 'none';
+  toolbar.style.display = 'none';
+  scanBtn.disabled      = on;
   activeTabBtn.disabled = on;
   if (on) {
-    statusBar.innerHTML = `<span class="spinner"></span><span style="color:var(--green)">scanning…</span>`;
+    statusBar.innerHTML    = `<span class="spinner"></span><span style="color:var(--green)">scanning…</span>`;
     resultsPanel.innerHTML = `<div class="empty-state">fetching resources…</div>`;
   }
 }
 
 function showError(msg) {
+  setLoading(false);
   resultsPanel.innerHTML = `<div class="error-msg">error: ${esc(msg)}</div>`;
-  statusBar.innerHTML = `<span style="color:var(--red)">failed</span>`;
+  statusBar.innerHTML    = `<span style="color:var(--red)">failed</span>`;
 }
 
 function emptyHtml(msg) {
@@ -174,8 +220,7 @@ function exportTxt() {
   if (!currentData) return;
   const d = currentData;
   const lines = [
-    `commentsExtractor — ${d.url}`,
-    `${d.timestamp}`,
+    `commentsExtractor — ${d.url}`, d.timestamp,
     `total: ${d.summary.total} comments\n`,
     `HTML Comments (${d.html.length}):`,
     ...d.html.map(c => `  - ${c}`)
@@ -190,7 +235,10 @@ function exportTxt() {
     lines.push(`\nJS: ${f.url} (${f.comments.length}):`);
     f.comments.forEach(c => lines.push(`  - ${c}`));
   });
-  download(new Blob([lines.join('\n')], { type: 'text/plain' }), `comments_${sanitize(d.url)}.txt`);
+  download(
+    new Blob([lines.join('\n')], { type: 'text/plain' }),
+    `comments_${sanitize(d.url)}.txt`
+  );
 }
 
 function download(blob, filename) {
@@ -203,5 +251,5 @@ function esc(s) {
 }
 
 function sanitize(url) {
-  return url.replace(/^https?:\/\//, '').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 60);
+  return url.replace(/^https?:\/\//,'').replace(/[^a-zA-Z0-9._-]/g,'_').slice(0,60);
 }

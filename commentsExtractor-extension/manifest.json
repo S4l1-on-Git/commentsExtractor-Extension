@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "commentsExtractor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Extract HTML, CSS, and JS comments from any webpage",
-  "permissions": ["activeTab", "scripting", "downloads", "storage"],
+  "permissions": ["activeTab", "scripting", "downloads", "storage", "tabs"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html",
